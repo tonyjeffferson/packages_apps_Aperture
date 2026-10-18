@@ -60,6 +60,13 @@
         <SwitchPreference
             app:defaultValue="false"
             app:iconSpaceReserved="false"
+            app:key="enable_xiaomi_qcfa_capture"
+            app:summary="@string/enable_xiaomi_qcfa_capture_summary"
+            app:title="@string/enable_xiaomi_qcfa_capture_title" />
+
+        <SwitchPreference
+            app:defaultValue="false"
+            app:iconSpaceReserved="false"
             app:key="enable_zsl"
             app:summary="@string/enable_zsl_summary"
             app:title="@string/enable_zsl_title" />

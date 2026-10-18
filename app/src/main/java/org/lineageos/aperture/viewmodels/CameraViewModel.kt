@@ -9,18 +9,22 @@ import android.animation.ValueAnimator
 import android.app.Application
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.ContentValues
 import android.graphics.ImageFormat
 import android.location.LocationManager
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Environment
 import android.os.PowerManager
+import android.provider.MediaStore
 import android.util.Log
 import android.view.OrientationEventListener
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.ExperimentalZeroShutterLag
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.exifinterface.media.ExifInterface
 import androidx.camera.extensions.ExtensionMode
 import androidx.camera.video.Quality
 import androidx.camera.video.Recording
@@ -93,9 +97,12 @@ import org.lineageos.aperture.repositories.CameraRepository
 import org.lineageos.aperture.utils.CameraSoundsUtils
 import org.lineageos.aperture.utils.StorageUtils
 import java.io.ByteArrayOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.Locale
 import kotlin.reflect.safeCast
 
 /**
@@ -182,6 +189,12 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
     val inSingleCaptureMode = MutableStateFlow(false)
 
     private val _cameraConfiguration = MutableStateFlow<CameraConfiguration?>(null)
+    val currentCameraConfiguration: CameraConfiguration?
+        get() = _cameraConfiguration.value
+
+    val enableXiaomiQcfaCapture: Boolean
+        get() = preferencesRepository.enableXiaomiQcfaCapture.value
+
     val cameraConfiguration = _cameraConfiguration
         .filterNotNull()
         .shareIn(
@@ -1153,6 +1166,68 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
                 onImageSavedCallback,
             )
         }
+    }
+
+    /** Save a JPEG produced by the Xiaomi QCFA Camera2 path using Aperture's camera folder. */
+    fun saveXiaomiQcfaPhoto(jpeg: ByteArray): Uri? {
+        val timestamp = System.currentTimeMillis()
+        val name = SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US).format(timestamp)
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DATE_TAKEN, timestamp)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_DCIM}/Camera")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+        }
+
+        val resolver = applicationContext.contentResolver
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: return null
+        return try {
+            resolver.openOutputStream(uri, "w")?.use { it.write(jpeg) }
+                ?: error("Unable to open output stream for QCFA image")
+
+            if (saveLocation.value == true) {
+                val location = this@CameraViewModel.location.value
+                if (location != null) {
+                    resolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
+                        ExifInterface(descriptor.fileDescriptor).apply {
+                            setLatLong(location.latitude, location.longitude)
+                            setAttribute(
+                                ExifInterface.TAG_DATETIME_ORIGINAL,
+                                SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
+                                    .format(Date(timestamp)),
+                            )
+                            saveAttributes()
+                        }
+                    }
+                }
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                resolver.update(
+                    uri,
+                    ContentValues().apply {
+                        put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    },
+                    null,
+                    null,
+                )
+            }
+            mediaRepository.broadcastNewPicture(uri)
+            uri
+        } catch (exception: Exception) {
+            resolver.delete(uri, null, null)
+            Log.e(LOG_TAG, "Unable to save Xiaomi QCFA image", exception)
+            null
+        }
+    }
+
+    fun onXiaomiQcfaCaptureStarted() {
+        cameraSoundsUtils.playShutterClick()
+        emitEvent(Event.PhotoCaptureStatus.CaptureStarted)
     }
 
     fun captureVideo() {

@@ -95,6 +95,9 @@
     <string name="zoom_buttons_invert_title">Inverter botões de ampliação</string>
     <string name="zoom_buttons_invert_summary">Inverter o comportamento dos botões de mais ou menos ampliação</string>
     <string name="photo_capture_mode_title">Modo de captura</string>
+    <string name="enable_xiaomi_qcfa_capture_title">Captura Xiaomi QCFA de 50 MP</string>
+    <string name="enable_xiaomi_qcfa_capture_summary">Utiliza o caminho remosaic da Xiaomi no vermeer. Se o HAL não devolver a imagem na resolução máxima, o Aperture utiliza o modo normal da câmara.</string>
+    <string name="xiaomi_qcfa_unavailable_toast">Captura de 50 MP indisponível. A utilizar o modo normal da câmara.</string>
     <string name="photo_capture_mode_maximize_quality">Maximizar qualidade</string>
     <string name="photo_capture_mode_minimize_latency">Minimizar latência</string>
     <string name="enable_zsl_title">Ativar ZSL quando disponível</string>
