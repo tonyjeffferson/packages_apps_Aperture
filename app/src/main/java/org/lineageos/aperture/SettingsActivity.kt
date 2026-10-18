@@ -161,6 +161,15 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
         private val photoCaptureMode by lazy {
             findPreference<ListPreference>("photo_capture_mode")!!
         }
+        private val usePhotoUltraHdr by lazy {
+            findPreference<SwitchPreference>("use_photo_jpeg_ultra_hdr")!!
+        }
+        private val enableRawCapture by lazy {
+            findPreference<SwitchPreference>("enable_raw_image_capture")!!
+        }
+        private val disableJpegWithRaw by lazy {
+            findPreference<SwitchPreference>("disable_jpeg_with_raw")!!
+        }
         private val saveLocation by lazy { findPreference<SwitchPreference>("save_location") }
         private val shutterSound by lazy { findPreference<SwitchPreference>("shutter_sound") }
 
@@ -179,11 +188,24 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
                 true
             }
 
+        private fun updateQcfaPreferenceAvailability(enabled: Boolean) {
+            photoCaptureMode.isEnabled = !enabled
+            enableZsl.isEnabled = !enabled && photoCaptureMode.value == "minimize_latency"
+            usePhotoUltraHdr.isEnabled = !enabled
+            enableRawCapture.isEnabled = !enabled
+            disableJpegWithRaw.isEnabled = !enabled && enableRawCapture.isChecked
+        }
+
         @Suppress("UnsafeOptInUsageError")
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
             super.onCreatePreferences(savedInstanceState, rootKey)
 
             xiaomiQcfaCapture.isVisible = Build.DEVICE.equals("vermeer", ignoreCase = true)
+            xiaomiQcfaCapture.onPreferenceChangeListener =
+                Preference.OnPreferenceChangeListener { _, newValue ->
+                    updateQcfaPreferenceAvailability(newValue as Boolean)
+                    true
+                }
 
             saveLocation?.let {
                 // Reset location back to off if permissions aren't granted
@@ -215,7 +237,7 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
 
             // Photo capture mode
             photoCaptureMode.onPreferenceChangeListener = photoCaptureModePreferenceChangeListener
-            enableZsl.isEnabled = photoCaptureMode.value == "minimize_latency"
+            updateQcfaPreferenceAvailability(xiaomiQcfaCapture.isChecked)
         }
     }
 
@@ -380,7 +402,14 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
             get() = "${sharedPreferencesKeyPrefix}_invert"
     }
 
-    class ProcessingSettingsFragment : SettingsFragment(R.xml.processing_preferences)
+    class ProcessingSettingsFragment : SettingsFragment(R.xml.processing_preferences) {
+        override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+            super.onCreatePreferences(savedInstanceState, rootKey)
+            val qcfaEnabled = preferenceManager.sharedPreferences
+                ?.getBoolean("enable_xiaomi_qcfa_capture", false) ?: false
+            preferenceScreen.isEnabled = !qcfaEnabled
+        }
+    }
 
     companion object {
         private val LOG_TAG = SettingsActivity::class.simpleName!!
