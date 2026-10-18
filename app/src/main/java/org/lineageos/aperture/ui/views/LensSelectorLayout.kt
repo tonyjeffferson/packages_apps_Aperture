@@ -31,6 +31,7 @@ class LensSelectorLayout @JvmOverloads constructor(
 
     private var usesLogicalZoomRatio = false
     private var currentZoomRatio = 1.0f
+    private var selectionEnabled = true
 
     private val buttonToApproximateZoomRatio = mutableMapOf<Button, Float>()
 
@@ -104,6 +105,13 @@ class LensSelectorLayout @JvmOverloads constructor(
         }
     }
 
+    fun setSelectionEnabled(enabled: Boolean) {
+        selectionEnabled = enabled
+        children.forEach { view ->
+            view.isEnabled = enabled
+        }
+    }
+
     fun setScreenRotation(screenRotation: Rotation) {
         this.screenRotation = screenRotation
 
@@ -117,6 +125,7 @@ class LensSelectorLayout @JvmOverloads constructor(
     private fun inflateButton(): Button {
         val button = layoutInflater.inflate(R.layout.lens_selector_button, this, false) as Button
         return button.apply {
+            isEnabled = selectionEnabled
             layoutParams = LayoutParams(32.px, 32.px).apply {
                 setMargins(5)
             }

@@ -31,6 +31,7 @@ import org.lineageos.aperture.models.GridMode
 import org.lineageos.aperture.models.HardwareKey
 import org.lineageos.aperture.models.HotPixelMode
 import org.lineageos.aperture.models.NoiseReductionMode
+import org.lineageos.aperture.models.PhotoAspectRatio
 import org.lineageos.aperture.models.Preference
 import org.lineageos.aperture.models.Preference.Companion.enumPreference
 import org.lineageos.aperture.models.Preference.Companion.primitivePreference
@@ -270,6 +271,7 @@ class PreferencesRepository(
         enumToPreferenceValue = mapOf(
             AspectRatio.RATIO_4_3 to "4_3",
             AspectRatio.RATIO_16_9 to "16_9",
+            PhotoAspectRatio.FULL_SCREEN to "full_screen",
         ),
     ).asPreferenceHolder()
 

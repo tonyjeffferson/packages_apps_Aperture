@@ -56,6 +56,7 @@ import androidx.camera.viewfinder.core.ZoomGestureDetector
 import androidx.cardview.widget.CardView
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.asFlow
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -79,9 +80,13 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.lineageos.aperture.ext.camera2CameraControl
 import org.lineageos.aperture.ext.flashMode
 import org.lineageos.aperture.ext.mapToRange
@@ -114,6 +119,7 @@ import org.lineageos.aperture.models.HardwareKey
 import org.lineageos.aperture.models.MediaType
 import org.lineageos.aperture.models.Permission
 import org.lineageos.aperture.models.PermissionState
+import org.lineageos.aperture.models.PhotoAspectRatio
 import org.lineageos.aperture.models.PhotoOutputFormat
 import org.lineageos.aperture.camera.XiaomiQcfaCapture
 import org.lineageos.aperture.models.Rotation
@@ -255,6 +261,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
     }
     private var zoomGestureDetectorIsInProgress = false
+    private var qcfaUiLocked = false
 
     private val handler = object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
@@ -457,12 +464,14 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
 
         // Observe manual focus
         viewFinder.setOnTouchListener { _, event ->
-            if (zoomGestureDetector.onTouchEvent(event) && zoomGestureDetectorIsInProgress) {
+            if (!qcfaUiLocked && zoomGestureDetector.onTouchEvent(event) && zoomGestureDetectorIsInProgress) {
                 return@setOnTouchListener true
             }
+            if (qcfaUiLocked) return@setOnTouchListener true
             return@setOnTouchListener gestureDetector.onTouchEvent(event)
         }
         viewFinder.setOnClickListener {
+            if (qcfaUiLocked) return@setOnClickListener
             // Reset exposure level to 0 EV
             viewModel.setExposureCompensationLevel(0.5f)
 
@@ -869,19 +878,44 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         }
 
         launch {
+            combine(
+                viewModel.isXiaomiQcfaCaptureEnabled,
+                viewModel.cameraConfiguration,
+            ) { enabled, configuration ->
+                enabled && xiaomiQcfaCapture.isSupportedDevice() &&
+                    configuration is CameraConfiguration.Photo &&
+                    configuration.camera.cameraId == "0" &&
+                    configuration.camera.cameraFacing == CameraFacing.BACK
+            }.collectLatest { lockControls ->
+                qcfaUiLocked = lockControls
+                if (lockControls) {
+                    viewModel.enforceQcfaPhotoConfiguration()
+                    viewModel.resetZoom()
+                }
+                aspectRatioButton.isEnabled = !lockControls && viewModel.cameraState.value == CameraState.IDLE
+                effectButton.isEnabled = !lockControls && viewModel.cameraState.value == CameraState.IDLE
+                flashButton.isEnabled = viewModel.cameraState.value == CameraState.IDLE
+                zoomLevel.isEnabled = !lockControls
+                lensSelectorLayout.setSelectionEnabled(!lockControls)
+                flipCameraButton.isEnabled = !lockControls && viewModel.cameraState.value == CameraState.IDLE
+            }
+        }
+
+        launch {
             viewModel.cameraState.collectLatest { cameraState ->
                 // Update secondary bar buttons
                 timerButton.isEnabled = cameraState == CameraState.IDLE
-                aspectRatioButton.isEnabled = cameraState == CameraState.IDLE
-                effectButton.isEnabled = cameraState == CameraState.IDLE
+                aspectRatioButton.isEnabled = cameraState == CameraState.IDLE && !qcfaUiLocked
+                effectButton.isEnabled = cameraState == CameraState.IDLE && !qcfaUiLocked
                 settingsButton.isEnabled = cameraState == CameraState.IDLE
+                flashButton.isEnabled = cameraState == CameraState.IDLE
 
                 lensSelectorLayout.setCameraState(cameraState)
 
                 // Update primary bar buttons
                 galleryButtonCardView.isEnabled = cameraState == CameraState.IDLE
                 // Shutter button must stay enabled
-                flipCameraButton.isEnabled = cameraState == CameraState.IDLE
+                flipCameraButton.isEnabled = cameraState == CameraState.IDLE && !qcfaUiLocked
                 videoRecordingStateButton.isVisible = cameraState.isRecordingVideo
 
                 // Update camera mode selector
@@ -1163,6 +1197,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                     when (photoAspectRatio) {
                         AspectRatio.RATIO_4_3 -> R.string.aspect_ratio_4_3
                         AspectRatio.RATIO_16_9 -> R.string.aspect_ratio_16_9
+                        PhotoAspectRatio.FULL_SCREEN -> R.string.aspect_ratio_full_screen
                         else -> throw Exception("Unknown aspect ratio $photoAspectRatio")
                     }
                 )
@@ -1480,6 +1515,15 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             }) not supported by camera ${cameraConfiguration.camera.cameraId}"
         }
 
+        viewFinder.scaleType = if (
+            cameraConfiguration is CameraConfiguration.Photo &&
+            cameraConfiguration.photoAspectRatio == PhotoAspectRatio.FULL_SCREEN
+        ) {
+            PreviewView.ScaleType.FILL_CENTER
+        } else {
+            PreviewView.ScaleType.FIT_CENTER
+        }
+
         // Make sure the extension mode is supported
         require(
             cameraConfiguration.camera.supportsExtensionMode(
@@ -1522,22 +1566,33 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                     PhotoOutputFormat.RAW_JPEG -> ImageCapture.OUTPUT_FORMAT_RAW_JPEG
                 }
 
+                val resolutionSelector = ResolutionSelector.Builder()
+                    .setAllowedResolutionMode(
+                        if (cameraConfiguration.enableHighResolution) {
+                            ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE
+                        } else {
+                            ResolutionSelector.PREFER_CAPTURE_RATE_OVER_HIGHER_RESOLUTION
+                        }
+                    )
+                if (cameraConfiguration.photoAspectRatio == PhotoAspectRatio.FULL_SCREEN) {
+                    val width = viewFinder.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+                    val height = viewFinder.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+                    val screenAspectRatio = maxOf(width, height).toFloat() / minOf(width, height)
+                    resolutionSelector.setResolutionFilter { supportedSizes, _ ->
+                        supportedSizes.sortedBy { size ->
+                            abs(size.width.toFloat() / size.height - screenAspectRatio)
+                        }
+                    }
+                } else {
+                    resolutionSelector.setAspectRatioStrategy(
+                        AspectRatioStrategy(
+                            cameraConfiguration.photoAspectRatio,
+                            AspectRatioStrategy.FALLBACK_RULE_AUTO,
+                        )
+                    )
+                }
                 viewModel.cameraController.imageCaptureResolutionSelector =
-                    ResolutionSelector.Builder()
-                        .setAspectRatioStrategy(
-                            AspectRatioStrategy(
-                                cameraConfiguration.photoAspectRatio,
-                                AspectRatioStrategy.FALLBACK_RULE_AUTO,
-                            )
-                        )
-                        .setAllowedResolutionMode(
-                            if (cameraConfiguration.enableHighResolution) {
-                                ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE
-                            } else {
-                                ResolutionSelector.PREFER_CAPTURE_RATE_OVER_HIGHER_RESOLUTION
-                            }
-                        )
-                        .build()
+                    resolutionSelector.build()
 
                 CameraController.IMAGE_CAPTURE
             }
@@ -1911,13 +1966,36 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             && photoConfiguration.camera.cameraId == "0"
             && photoConfiguration.camera.cameraFacing == CameraFacing.BACK
             && photoConfiguration.photoOutputFormat == PhotoOutputFormat.JPEG
+            && photoConfiguration.photoAspectRatio == AspectRatio.RATIO_4_3
+            && photoConfiguration.photoCaptureMode == ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
             && photoConfiguration.extensionMode == ExtensionMode.NONE
             && photoConfiguration.camera2Options == CameraConfiguration.Camera2Options.DEFAULT
             && (viewModel.zoomState.value?.zoomRatio ?: 1f) == 1f
-            && viewModel.cameraController.flashMode != FlashMode.SCREEN
+            && viewModel.flashMode.value in setOf(FlashMode.OFF, FlashMode.AUTO, FlashMode.ON, FlashMode.TORCH)
+
+        val qcfaFlashMode = viewModel.flashMode.value
+
+        Log.i(
+            LOG_TAG,
+            "QCFA route: selected=$useXiaomiQcfa enabled=${viewModel.enableXiaomiQcfaCapture} " +
+                "device=${xiaomiQcfaCapture.isSupportedDevice()} camera=${photoConfiguration?.camera?.cameraId} " +
+                "format=${photoConfiguration?.photoOutputFormat} extension=${photoConfiguration?.extensionMode} " +
+                "aspect=${photoConfiguration?.photoAspectRatio} captureMode=${photoConfiguration?.photoCaptureMode} " +
+                "defaultOptions=${photoConfiguration?.camera2Options == CameraConfiguration.Camera2Options.DEFAULT} " +
+                "zoom=${viewModel.zoomState.value?.zoomRatio} flash=$qcfaFlashMode",
+        )
 
         if (!useXiaomiQcfa) {
-            viewModel.takePhoto()
+            val fullScreenAspectRatio = if (
+                photoConfiguration?.photoAspectRatio == PhotoAspectRatio.FULL_SCREEN
+            ) {
+                val width = viewFinder.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+                val height = viewFinder.height.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+                width.toFloat() / height
+            } else {
+                null
+            }
+            viewModel.takePhoto(fullScreenAspectRatio)
             return
         }
 
@@ -1925,19 +2003,59 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
             return
         }
 
+        // Cache this while camera ID 0 is still present. On vermeer, a HAL capture error can
+        // remove the ID before the asynchronous cleanup path finishes.
+        val qcfaJpegOrientation = if (useXiaomiQcfa) {
+            runCatching {
+                xiaomiQcfaCapture.jpegOrientation(
+                    photoConfiguration!!.camera.cameraId,
+                    viewModel.screenRotation.value.offset,
+                )
+            }.getOrDefault(0)
+        } else {
+            0
+        }
+
         lifecycleScope.launch {
             viewModel.cameraState.value = CameraState.TAKING_PHOTO
             previewBlurView.freeze()
             previewBlurView.isVisible = true
+            val cameraXCameraState = viewModel.cameraController.cameraInfo
+                ?.cameraState
+                ?.asFlow<CameraXCameraState>()
+            val cameraXStateBeforeUnbind = cameraXCameraState?.first()
+            Log.i(
+                LOG_TAG,
+                "QCFA route: active CameraController state before unbind=${cameraXStateBeforeUnbind?.type}",
+            )
             viewModel.cameraController.unbind()
 
-            val jpeg = try {
+            val cameraXReleased = if (
+                cameraXCameraState != null &&
+                cameraXStateBeforeUnbind?.type == CameraXCameraState.Type.OPEN
+            ) {
+                withTimeoutOrNull(CAMERA_RELEASE_TIMEOUT_MS) {
+                    cameraXCameraState.first {
+                        it.type == CameraXCameraState.Type.CLOSED
+                    }
+                } != null
+            } else {
+                false
+            }
+            if (cameraXReleased) {
+                delay(CAMERA_RELEASE_SETTLE_MS)
+            }
+            Log.i(
+                LOG_TAG,
+                "QCFA route: CameraController released camera=${photoConfiguration.camera.cameraId}: $cameraXReleased",
+            )
+
+            val jpeg = if (!cameraXReleased) {
+                Log.w(LOG_TAG, "CameraX did not release the camera; using the normal capture path")
+                null
+            } else try {
                 withContext(Dispatchers.IO) {
-                    xiaomiQcfaCapture.capture(
-                        photoConfiguration.camera.cameraId,
-                        viewModel.screenRotation.value.offset,
-                        viewModel.cameraController.flashMode,
-                    )
+                    xiaomiQcfaCapture.capture(photoConfiguration.camera.cameraId, qcfaFlashMode)
                 }
             } catch (exception: CancellationException) {
                 throw exception
@@ -1946,7 +2064,9 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
                 null
             }
             val uri = jpeg?.let { image ->
-                withContext(Dispatchers.IO) { viewModel.saveXiaomiQcfaPhoto(image) }
+                withContext(Dispatchers.IO) {
+                    viewModel.saveXiaomiQcfaPhoto(image, qcfaJpegOrientation)
+                }
             }
 
             viewModel.cameraState.value = CameraState.IDLE
@@ -2150,6 +2270,8 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         private const val MSG_HIDE_FOCUS_RING = 1
         private const val MSG_HIDE_EXPOSURE_SLIDER = 2
         private const val MSG_ON_PINCH_TO_ZOOM = 3
+        private const val CAMERA_RELEASE_TIMEOUT_MS = 3_000L
+        private const val CAMERA_RELEASE_SETTLE_MS = 300L
 
         // We need to return something small enough so as not to overwhelm Binder. 1MB is the
         // per-process limit across all transactions. Camera2 sets a max pixel count of 51200.

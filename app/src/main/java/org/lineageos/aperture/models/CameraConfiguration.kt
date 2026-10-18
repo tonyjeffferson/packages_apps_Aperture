@@ -9,6 +9,11 @@ import androidx.camera.core.AspectRatio
 import androidx.camera.extensions.ExtensionMode
 import androidx.camera.video.Quality
 
+/** Extra photo ratio option handled by Aperture's resolution selector. */
+object PhotoAspectRatio {
+    const val FULL_SCREEN = -1
+}
+
 /**
  * Camera configuration. Should only contain information about the session that can only be
  * configured at binding time.

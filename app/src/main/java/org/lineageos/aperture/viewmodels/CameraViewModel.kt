@@ -10,6 +10,11 @@ import android.app.Application
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.ContentValues
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
+import android.graphics.Matrix
+import android.graphics.Rect
 import android.graphics.ImageFormat
 import android.location.LocationManager
 import android.net.Uri
@@ -61,6 +66,7 @@ import kotlinx.coroutines.flow.runningFold
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import org.lineageos.aperture.ext.applicationContext
 import org.lineageos.aperture.ext.broadcastReceiverFlow
@@ -88,6 +94,7 @@ import org.lineageos.aperture.models.HotPixelMode
 import org.lineageos.aperture.models.IslandItem
 import org.lineageos.aperture.models.NoiseReductionMode
 import org.lineageos.aperture.models.PhotoOutputFormat
+import org.lineageos.aperture.models.PhotoAspectRatio
 import org.lineageos.aperture.models.Rotation
 import org.lineageos.aperture.models.ShadingMode
 import org.lineageos.aperture.models.ThermalStatus
@@ -97,6 +104,7 @@ import org.lineageos.aperture.repositories.CameraRepository
 import org.lineageos.aperture.utils.CameraSoundsUtils
 import org.lineageos.aperture.utils.StorageUtils
 import java.io.ByteArrayOutputStream
+import java.io.ByteArrayInputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.concurrent.ExecutorService
@@ -194,6 +202,9 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
 
     val enableXiaomiQcfaCapture: Boolean
         get() = preferencesRepository.enableXiaomiQcfaCapture.value
+
+    val isXiaomiQcfaCaptureEnabled = preferencesRepository.enableXiaomiQcfaCapture
+        .stateIn(viewModelScope, SharingStarted.Eagerly, enableXiaomiQcfaCapture)
 
     val cameraConfiguration = _cameraConfiguration
         .filterNotNull()
@@ -1037,7 +1048,7 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
         )
     }
 
-    fun takePhoto() {
+    fun takePhoto(fullScreenAspectRatio: Float? = null) {
         // Bail out if a photo is already being taken
         if (cameraState.value == CameraState.TAKING_PHOTO) {
             return
@@ -1089,6 +1100,17 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
 
         // Set up image capture listener, which is triggered after photo has
         // been taken
+        fun publishImageSaved(output: ImageCapture.OutputFileResults) {
+            Log.d(LOG_TAG, "Photo capture succeeded: ${output.savedUri} format = ${output.imageFormat}")
+            if (!inSingleCaptureMode.value) {
+                output.savedUri?.let { mediaRepository.broadcastNewPicture(it) }
+            }
+            if (imageCount.decrementAndGet() == 0) cameraState.value = CameraState.IDLE
+            if (imageOutputFormat == ImageCapture.OUTPUT_FORMAT_RAW_JPEG &&
+                output.imageFormat in RAW_FORMATS) return
+            emitEvent(Event.PhotoCaptureStatus.ImageSaved(output, photoOutputStream))
+        }
+
         val onImageSavedCallback = object : ImageCapture.OnImageSavedCallback {
             override fun onCaptureStarted() {
                 emitEvent(Event.PhotoCaptureStatus.CaptureStarted)
@@ -1097,34 +1119,34 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
             }
 
             override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                Log.d(
-                    LOG_TAG,
-                    "Photo capture succeeded: ${output.savedUri} format = ${output.imageFormat}"
-                )
-
-                if (!inSingleCaptureMode.value) {
-                    output.savedUri?.let {
-                        mediaRepository.broadcastNewPicture(it)
-                    }
-                }
-
-                if (imageCount.decrementAndGet() == 0) {
-                    cameraState.value = CameraState.IDLE
-                }
-
-                // We only care about JPEG-like formats
-                if (imageOutputFormat == ImageCapture.OUTPUT_FORMAT_RAW_JPEG
-                    && output.imageFormat in RAW_FORMATS
+                if (fullScreenAspectRatio == null ||
+                    imageOutputFormat != ImageCapture.OUTPUT_FORMAT_JPEG
                 ) {
+                    publishImageSaved(output)
                     return
                 }
 
-                emitEvent(
-                    Event.PhotoCaptureStatus.ImageSaved(
-                        output,
-                        photoOutputStream,
-                    )
-                )
+                viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        val uri = output.savedUri
+                        if (uri != null) {
+                            cropSavedJpegToAspectRatio(uri, fullScreenAspectRatio)
+                        } else {
+                            (photoOutputStream as? ByteArrayOutputStream)?.let { stream ->
+                                val cropped = cropJpegToAspectRatio(
+                                    stream.toByteArray(), fullScreenAspectRatio,
+                                )
+                                stream.reset()
+                                stream.write(cropped)
+                            }
+                        }
+                    } catch (exception: Exception) {
+                        Log.e(LOG_TAG, "Unable to crop photo to the full-screen aspect ratio", exception)
+                    }
+                    withContext(Dispatchers.Main) {
+                        publishImageSaved(output)
+                    }
+                }
             }
 
             override fun onError(exc: ImageCaptureException) {
@@ -1168,8 +1190,125 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
         }
     }
 
+    /** Crop the center of a JPEG so the saved photo matches the full-screen preview. */
+    private fun cropJpegToAspectRatio(jpeg: ByteArray, displayAspectRatio: Float): ByteArray {
+        require(displayAspectRatio.isFinite() && displayAspectRatio > 0f)
+        val exif = ExifInterface(ByteArrayInputStream(jpeg))
+        val orientation = exif.getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL,
+        )
+        val swapsAxes = orientation in setOf(
+            ExifInterface.ORIENTATION_TRANSPOSE,
+            ExifInterface.ORIENTATION_ROTATE_90,
+            ExifInterface.ORIENTATION_TRANSVERSE,
+            ExifInterface.ORIENTATION_ROTATE_270,
+        )
+        val rawAspectRatio = if (swapsAxes) 1f / displayAspectRatio else displayAspectRatio
+        val decoder = BitmapRegionDecoder.newInstance(ByteArrayInputStream(jpeg), false)
+            ?: error("Unable to decode JPEG for full-screen crop")
+        val width = decoder.width
+        val height = decoder.height
+        val sourceAspectRatio = width.toFloat() / height
+        val crop = if (sourceAspectRatio > rawAspectRatio) {
+            val cropWidth = (height * rawAspectRatio).toInt().coerceIn(1, width)
+            val left = (width - cropWidth) / 2
+            Rect(left, 0, left + cropWidth, height)
+        } else {
+            val cropHeight = (width / rawAspectRatio).toInt().coerceIn(1, height)
+            val top = (height - cropHeight) / 2
+            Rect(0, top, width, top + cropHeight)
+        }
+        val croppedBitmap = try {
+            decoder.decodeRegion(crop, BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }) ?: error("Unable to decode JPEG crop")
+        } finally {
+            decoder.recycle()
+        }
+
+        // Physically normalize rotation so byte-array captures do not depend on EXIF orientation.
+        val transform = Matrix().apply {
+            when (orientation) {
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> setScale(-1f, 1f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> setRotate(180f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> setScale(1f, -1f)
+                ExifInterface.ORIENTATION_TRANSPOSE -> { setRotate(90f); postScale(-1f, 1f) }
+                ExifInterface.ORIENTATION_ROTATE_90 -> setRotate(90f)
+                ExifInterface.ORIENTATION_TRANSVERSE -> { setRotate(-90f); postScale(-1f, 1f) }
+                ExifInterface.ORIENTATION_ROTATE_270 -> setRotate(-90f)
+            }
+        }
+        val outputBitmap = if (transform.isIdentity) croppedBitmap else Bitmap.createBitmap(
+            croppedBitmap, 0, 0, croppedBitmap.width, croppedBitmap.height, transform, true,
+        ).also { if (it !== croppedBitmap) croppedBitmap.recycle() }
+
+        return try {
+            ByteArrayOutputStream().use { output ->
+                check(outputBitmap.compress(Bitmap.CompressFormat.JPEG, 95, output)) {
+                    "Unable to encode full-screen JPEG crop"
+                }
+                output.toByteArray()
+            }
+        } finally {
+            outputBitmap.recycle()
+        }
+    }
+
+    private fun cropSavedJpegToAspectRatio(uri: Uri, displayAspectRatio: Float) {
+        val resolver = applicationContext.contentResolver
+        val original = resolver.openInputStream(uri)?.use { it.readBytes() }
+            ?: error("Unable to read captured JPEG before cropping")
+        val originalExif = ExifInterface(ByteArrayInputStream(original))
+        val attributes = listOf(
+            ExifInterface.TAG_DATETIME,
+            ExifInterface.TAG_DATETIME_ORIGINAL,
+            ExifInterface.TAG_DATETIME_DIGITIZED,
+            ExifInterface.TAG_MAKE,
+            ExifInterface.TAG_MODEL,
+            ExifInterface.TAG_FOCAL_LENGTH,
+            ExifInterface.TAG_F_NUMBER,
+            ExifInterface.TAG_EXPOSURE_TIME,
+            ExifInterface.TAG_ISO_SPEED_RATINGS,
+            ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
+            ExifInterface.TAG_FLASH,
+            ExifInterface.TAG_WHITE_BALANCE,
+            ExifInterface.TAG_GPS_LATITUDE,
+            ExifInterface.TAG_GPS_LATITUDE_REF,
+            ExifInterface.TAG_GPS_LONGITUDE,
+            ExifInterface.TAG_GPS_LONGITUDE_REF,
+            ExifInterface.TAG_GPS_ALTITUDE,
+            ExifInterface.TAG_GPS_ALTITUDE_REF,
+            ExifInterface.TAG_GPS_TIMESTAMP,
+            ExifInterface.TAG_GPS_DATESTAMP,
+        ).mapNotNull { tag -> originalExif.getAttribute(tag)?.let { tag to it } }
+        val cropped = cropJpegToAspectRatio(original, displayAspectRatio)
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(cropped, 0, cropped.size, bounds)
+        resolver.openOutputStream(uri, "wt")?.use { it.write(cropped) }
+            ?: error("Unable to replace captured JPEG with full-screen crop")
+        resolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
+            ExifInterface(descriptor.fileDescriptor).apply {
+                attributes.forEach { (tag, value) -> setAttribute(tag, value) }
+                setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
+                setAttribute(ExifInterface.TAG_IMAGE_WIDTH, bounds.outWidth.toString())
+                setAttribute(ExifInterface.TAG_IMAGE_LENGTH, bounds.outHeight.toString())
+                setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, bounds.outWidth.toString())
+                setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, bounds.outHeight.toString())
+                saveAttributes()
+            }
+        } ?: error("Unable to write EXIF data for full-screen crop")
+        resolver.update(
+            uri,
+            ContentValues().apply { put(MediaStore.MediaColumns.SIZE, cropped.size) },
+            null,
+            null,
+        )
+        Log.i(LOG_TAG, "Saved full-screen JPEG crop for ${uri}")
+    }
+
     /** Save a JPEG produced by the Xiaomi QCFA Camera2 path using Aperture's camera folder. */
-    fun saveXiaomiQcfaPhoto(jpeg: ByteArray): Uri? {
+    fun saveXiaomiQcfaPhoto(jpeg: ByteArray, jpegOrientation: Int): Uri? {
         val timestamp = System.currentTimeMillis()
         val name = SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US).format(timestamp)
         val values = ContentValues().apply {
@@ -1189,20 +1328,28 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
             resolver.openOutputStream(uri, "w")?.use { it.write(jpeg) }
                 ?: error("Unable to open output stream for QCFA image")
 
-            if (saveLocation.value == true) {
-                val location = this@CameraViewModel.location.value
-                if (location != null) {
-                    resolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
-                        ExifInterface(descriptor.fileDescriptor).apply {
+            val location = this@CameraViewModel.location.value
+                .takeIf { saveLocation.value == true }
+            resolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
+                ExifInterface(descriptor.fileDescriptor).apply {
+                    setAttribute(
+                        ExifInterface.TAG_ORIENTATION,
+                        when (jpegOrientation) {
+                            90 -> ExifInterface.ORIENTATION_ROTATE_90.toString()
+                            180 -> ExifInterface.ORIENTATION_ROTATE_180.toString()
+                            270 -> ExifInterface.ORIENTATION_ROTATE_270.toString()
+                            else -> ExifInterface.ORIENTATION_NORMAL.toString()
+                        },
+                    )
+                    setAttribute(
+                        ExifInterface.TAG_DATETIME_ORIGINAL,
+                        SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
+                            .format(Date(timestamp)),
+                    )
+                    if (location != null) {
                             setLatLong(location.latitude, location.longitude)
-                            setAttribute(
-                                ExifInterface.TAG_DATETIME_ORIGINAL,
-                                SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
-                                    .format(Date(timestamp)),
-                            )
-                            saveAttributes()
-                        }
                     }
+                    saveAttributes()
                 }
             }
 
@@ -1480,9 +1627,15 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
      */
     fun cyclePhotoAspectRatio() =
         updateConfiguration<CameraConfiguration.Photo> { cameraConfiguration ->
+            if (isQcfaConfiguration(cameraConfiguration)) {
+                return@updateConfiguration cameraConfiguration.copy(
+                    photoAspectRatio = AspectRatio.RATIO_4_3,
+                )
+            }
             val newAspectRatio = when (cameraConfiguration.photoAspectRatio) {
                 AspectRatio.RATIO_4_3 -> AspectRatio.RATIO_16_9
-                AspectRatio.RATIO_16_9 -> AspectRatio.RATIO_4_3
+                AspectRatio.RATIO_16_9 -> PhotoAspectRatio.FULL_SCREEN
+                PhotoAspectRatio.FULL_SCREEN -> AspectRatio.RATIO_4_3
                 else -> AspectRatio.RATIO_4_3
             }
 
@@ -1492,6 +1645,33 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
                 photoAspectRatio = newAspectRatio,
             )
         }
+
+    private fun isQcfaConfiguration(configuration: CameraConfiguration.Photo) =
+        enableXiaomiQcfaCapture &&
+            android.os.Build.DEVICE.equals("vermeer", ignoreCase = true) &&
+            configuration.camera.cameraId == "0" &&
+            configuration.camera.cameraFacing == CameraFacing.BACK
+
+    fun enforceQcfaPhotoConfiguration() {
+        updateConfiguration<CameraConfiguration.Photo> { configuration ->
+            if (!enableXiaomiQcfaCapture ||
+                !android.os.Build.DEVICE.equals("vermeer", ignoreCase = true) ||
+                configuration.camera.cameraId != "0" ||
+                configuration.camera.cameraFacing != CameraFacing.BACK
+            ) {
+                configuration
+            } else {
+                preferencesRepository.photoAspectRatio.value = AspectRatio.RATIO_4_3
+                configuration.copy(
+                    extensionMode = ExtensionMode.NONE,
+                    camera2Options = CameraConfiguration.Camera2Options.DEFAULT,
+                    photoCaptureMode = ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY,
+                    photoAspectRatio = AspectRatio.RATIO_4_3,
+                    photoOutputFormat = PhotoOutputFormat.JPEG,
+                )
+            }
+        }
+    }
 
     /**
      * Cycle the video quality.
@@ -1722,8 +1902,16 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
         cameraMode: CameraMode,
     ) = when (cameraMode) {
         CameraMode.PHOTO -> {
+            val useQcfaCapture = preferencesRepository.enableXiaomiQcfaCapture.value &&
+                android.os.Build.DEVICE.equals("vermeer", ignoreCase = true) &&
+                camera.cameraId == "0" && camera.cameraFacing == CameraFacing.BACK
+            if (useQcfaCapture) {
+                preferencesRepository.photoAspectRatio.value = AspectRatio.RATIO_4_3
+            }
             // Enable ZSL when requested by the user and supported by the camera
-            val photoCaptureMode = when (
+            val photoCaptureMode = if (useQcfaCapture) {
+                ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
+            } else when (
                 val photoCaptureMode = preferencesRepository.photoCaptureMode.value
             ) {
                 ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY -> when (
@@ -1740,6 +1928,7 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
             val enableRawImageCapture = preferencesRepository.enableRawImageCapture.value
             val disableJpegWithRaw = preferencesRepository.disableJpegWithRaw.value
             val photoOutputFormat = when {
+                useQcfaCapture -> PhotoOutputFormat.JPEG
                 inSingleCaptureMode.value -> PhotoOutputFormat.JPEG
 
                 enableRawImageCapture
@@ -1761,10 +1950,22 @@ class CameraViewModel(application: Application) : ApertureViewModel(application)
 
             CameraConfiguration.Photo(
                 camera = camera,
-                extensionMode = preferencesRepository.photoEffect.value,
-                camera2Options = buildPhotoCamera2Options(camera, photoCaptureMode),
+                extensionMode = if (useQcfaCapture) {
+                    ExtensionMode.NONE
+                } else {
+                    preferencesRepository.photoEffect.value
+                },
+                camera2Options = if (useQcfaCapture) {
+                    CameraConfiguration.Camera2Options.DEFAULT
+                } else {
+                    buildPhotoCamera2Options(camera, photoCaptureMode)
+                },
                 photoCaptureMode = photoCaptureMode,
-                photoAspectRatio = preferencesRepository.photoAspectRatio.value,
+                photoAspectRatio = if (useQcfaCapture) {
+                    AspectRatio.RATIO_4_3
+                } else {
+                    preferencesRepository.photoAspectRatio.value
+                },
                 enableHighResolution = overlaysRepository.enableHighResolution,
                 photoOutputFormat = photoOutputFormat,
             )
