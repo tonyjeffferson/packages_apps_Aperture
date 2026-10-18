@@ -75,6 +75,7 @@ import coil3.size.Scale
 import coil3.video.VideoFrameDecoder
 import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
@@ -114,6 +115,7 @@ import org.lineageos.aperture.models.MediaType
 import org.lineageos.aperture.models.Permission
 import org.lineageos.aperture.models.PermissionState
 import org.lineageos.aperture.models.PhotoOutputFormat
+import org.lineageos.aperture.camera.XiaomiQcfaCapture
 import org.lineageos.aperture.models.Rotation
 import org.lineageos.aperture.models.ThermalStatus
 import org.lineageos.aperture.models.TimerMode
@@ -148,6 +150,7 @@ import androidx.camera.core.CameraState as CameraXCameraState
 open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
     // View models
     private val viewModel by viewModels<CameraViewModel>()
+    private val xiaomiQcfaCapture by lazy { XiaomiQcfaCapture(this) }
 
     // Views
     private val aspectRatioButton by lazy { findViewById<Button>(R.id.aspectRatioButton) }
@@ -535,7 +538,7 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
 
             startTimerAndRun {
                 when (viewModel.cameraMode.value) {
-                    CameraMode.PHOTO -> viewModel.takePhoto()
+                    CameraMode.PHOTO -> takePhoto()
                     CameraMode.VIDEO -> viewModel.captureVideo()
                     else -> {}
                 }
@@ -1896,6 +1899,80 @@ open class CameraActivity : AppCompatActivity(R.layout.activity_camera) {
         countDownView.startCountDown(timerModeSeconds) {
             viewModel.cameraState.value = previousCameraState
             runnable()
+        }
+    }
+
+    private fun takePhoto() {
+        val configuration = viewModel.currentCameraConfiguration
+        val photoConfiguration = configuration as? CameraConfiguration.Photo
+        val useXiaomiQcfa = viewModel.enableXiaomiQcfaCapture
+            && xiaomiQcfaCapture.isSupportedDevice()
+            && photoConfiguration != null
+            && photoConfiguration.camera.cameraId == "0"
+            && photoConfiguration.camera.cameraFacing == CameraFacing.BACK
+            && photoConfiguration.photoOutputFormat == PhotoOutputFormat.JPEG
+            && photoConfiguration.extensionMode == ExtensionMode.NONE
+            && photoConfiguration.camera2Options == CameraConfiguration.Camera2Options.DEFAULT
+            && (viewModel.zoomState.value?.zoomRatio ?: 1f) == 1f
+            && viewModel.cameraController.flashMode != FlashMode.SCREEN
+
+        if (!useXiaomiQcfa) {
+            viewModel.takePhoto()
+            return
+        }
+
+        if (viewModel.cameraState.value != CameraState.IDLE) {
+            return
+        }
+
+        lifecycleScope.launch {
+            viewModel.cameraState.value = CameraState.TAKING_PHOTO
+            previewBlurView.freeze()
+            previewBlurView.isVisible = true
+            viewModel.cameraController.unbind()
+
+            val jpeg = try {
+                withContext(Dispatchers.IO) {
+                    xiaomiQcfaCapture.capture(
+                        photoConfiguration.camera.cameraId,
+                        viewModel.screenRotation.value.offset,
+                        viewModel.cameraController.flashMode,
+                    )
+                }
+            } catch (exception: CancellationException) {
+                throw exception
+            } catch (exception: Exception) {
+                Log.w(LOG_TAG, "Xiaomi QCFA capture failed; falling back to CameraX", exception)
+                null
+            }
+            val uri = jpeg?.let { image ->
+                withContext(Dispatchers.IO) { viewModel.saveXiaomiQcfaPhoto(image) }
+            }
+
+            viewModel.cameraState.value = CameraState.IDLE
+            bindCameraUseCases(photoConfiguration)
+
+            if (uri == null) {
+                Toast.makeText(
+                    this@CameraActivity,
+                    R.string.xiaomi_qcfa_unavailable_toast,
+                    Toast.LENGTH_LONG,
+                ).show()
+                try {
+                    viewModel.cameraController.initializationFuture.await()
+                    viewModel.takePhoto()
+                } catch (exception: Exception) {
+                    Log.e(LOG_TAG, "Unable to restore CameraX after QCFA failure", exception)
+                }
+                return@launch
+            }
+
+            viewModel.onXiaomiQcfaCaptureStarted()
+            if (viewModel.inSingleCaptureMode.value) {
+                openCapturePreview(uri, MediaType.PHOTO)
+            } else {
+                onCapturedMedia(uri)
+            }
         }
     }
 

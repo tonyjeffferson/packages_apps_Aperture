@@ -6,6 +6,7 @@
 package org.lineageos.aperture
 
 import android.hardware.input.InputManager
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyCharacterMap
@@ -153,6 +154,9 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
     }
 
     class RootSettingsFragment : SettingsFragment(R.xml.root_preferences) {
+        private val xiaomiQcfaCapture by lazy {
+            findPreference<SwitchPreference>("enable_xiaomi_qcfa_capture")!!
+        }
         private val enableZsl by lazy { findPreference<SwitchPreference>("enable_zsl")!! }
         private val photoCaptureMode by lazy {
             findPreference<ListPreference>("photo_capture_mode")!!
@@ -178,6 +182,8 @@ class SettingsActivity : AppCompatActivity(R.layout.activity_settings) {
         @Suppress("UnsafeOptInUsageError")
         override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
             super.onCreatePreferences(savedInstanceState, rootKey)
+
+            xiaomiQcfaCapture.isVisible = Build.DEVICE.equals("vermeer", ignoreCase = true)
 
             saveLocation?.let {
                 // Reset location back to off if permissions aren't granted

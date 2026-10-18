@@ -132,6 +132,9 @@
 
     <!-- Photo Preferences -->
     <string name="photo_capture_mode_title">Capture mode</string>
+    <string name="enable_xiaomi_qcfa_capture_title">Xiaomi 50 MP QCFA capture</string>
+    <string name="enable_xiaomi_qcfa_capture_summary">Use the Xiaomi remosaic path on vermeer. If the HAL does not return a full-resolution image, Aperture uses its normal camera path.</string>
+    <string name="xiaomi_qcfa_unavailable_toast">50 MP capture unavailable. Using the normal camera mode.</string>
     <string name="photo_capture_mode_maximize_quality">Maximize quality</string>
     <string name="photo_capture_mode_minimize_latency">Minimize latency</string>
     <string name="enable_zsl_title">Enable ZSL when available</string>

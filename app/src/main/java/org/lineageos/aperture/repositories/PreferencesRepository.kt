@@ -132,6 +132,14 @@ class PreferencesRepository(
     ).asPreferenceHolder()
 
     /**
+     * Use the Xiaomi QCFA vendor capture path on supported devices.
+     */
+    val enableXiaomiQcfaCapture = primitivePreference(
+        key = "enable_xiaomi_qcfa_capture",
+        defaultValue = false,
+    ).asPreferenceHolder()
+
+    /**
      * Whether zero shutter lag should be used when available.
      */
     val enableZsl = primitivePreference(
